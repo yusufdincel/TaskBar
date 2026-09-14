@@ -1,7 +1,10 @@
+#define _WIN32_WINNT 0x0602
 #include <windows.h>
 #include <dwmapi.h>
 #include <d2d1.h>
 #include <wincodec.h>
+#include <shobjidl.h>
+#include <propidl.h>
 #include <vector>
 #include <string>
 #include <cmath>
@@ -11,6 +14,12 @@
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
+
+const PROPERTYKEY PKEY_AppUserModel_ID_Local = { {0x9F4C2855, 0x9F79, 0x4B39, {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}}, 5 };
+const GUID IID_IPropertyStore_Local = { 0x886d8eeb, 0x8cf2, 0x4446, { 0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99 } };
+const GUID IID_IShellItem_Local = { 0x43826d1e, 0xe718, 0x42ee, { 0xbc, 0x55, 0xa1, 0xe2, 0x61, 0xc3, 0x7b, 0xfe } };
+const GUID IID_IShellItemImageFactory_Local = { 0xbcc18b79, 0xba16, 0x442f, { 0x80, 0xc4, 0x8a, 0x59, 0xc3, 0x0c, 0x46, 0x3b } };
 
 HWND g_hDock = NULL;
 ID2D1Factory* pFactory = nullptr;
@@ -45,15 +54,6 @@ D2D1::ColorF GetColorFromHWND(HWND hwnd) {
     return D2D1::ColorF((hash % 255)/255.0f, ((hash >> 4) % 255)/255.0f, ((hash >> 8) % 255)/255.0f);
 }
 
-HICON GetWindowIcon(HWND hwnd) {
-    HICON hIcon = NULL;
-    SendMessageTimeout(hwnd, WM_GETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG, 50, (PDWORD_PTR)&hIcon);
-    if (!hIcon) hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
-    if (!hIcon) SendMessageTimeout(hwnd, WM_GETICON, ICON_SMALL, 0, SMTO_ABORTIFHUNG, 50, (PDWORD_PTR)&hIcon);
-    if (!hIcon) hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
-    return hIcon;
-}
-
 ID2D1Bitmap* HIconToBitmap(HICON hIcon) {
     if (!pWicFactory || !pRenderTarget || !hIcon) return nullptr;
     IWICBitmap* pWicBitmap = nullptr;
@@ -71,6 +71,62 @@ ID2D1Bitmap* HIconToBitmap(HICON hIcon) {
     return pD2dBitmap;
 }
 
+ID2D1Bitmap* GetUWPAppIcon(HWND hwnd) {
+    if (!pWicFactory || !pRenderTarget) return nullptr;
+
+    IPropertyStore* pps = nullptr;
+    if (FAILED(SHGetPropertyStoreForWindow(hwnd, IID_IPropertyStore_Local, (void**)&pps))) return nullptr;
+
+    PROPVARIANT prop = {}; 
+    HRESULT hr = pps->GetValue(PKEY_AppUserModel_ID_Local, &prop);
+    ID2D1Bitmap* pD2dBitmap = nullptr;
+    
+    if (SUCCEEDED(hr) && prop.vt == VT_LPWSTR) {
+        std::wstring parseName = L"shell:AppsFolder\\";
+        parseName += prop.pwszVal;
+
+        IShellItem* pItem = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(parseName.c_str(), nullptr, IID_IShellItem_Local, (void**)&pItem))) {
+            IShellItemImageFactory* pFactory = nullptr;
+            if (SUCCEEDED(pItem->QueryInterface(IID_IShellItemImageFactory_Local, (void**)&pFactory))) {
+                HBITMAP hbmp = nullptr;
+                SIZE size = { 64, 64 };
+                if (SUCCEEDED(pFactory->GetImage(size, SIIGBF_ICONONLY, &hbmp))) {
+                    IWICBitmap* pWicBitmap = nullptr;
+                    if (SUCCEEDED(pWicFactory->CreateBitmapFromHBITMAP(hbmp, NULL, WICBitmapUseAlpha, &pWicBitmap))) {
+                        IWICFormatConverter* pConverter = nullptr;
+                        pWicFactory->CreateFormatConverter(&pConverter);
+                        pConverter->Initialize(pWicBitmap, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, NULL, 0.0f, WICBitmapPaletteTypeMedianCut);
+                        pRenderTarget->CreateBitmapFromWicBitmap(pConverter, NULL, &pD2dBitmap);
+                        pConverter->Release();
+                        pWicBitmap->Release();
+                    }
+                    DeleteObject(hbmp);
+                }
+                pFactory->Release();
+            }
+            pItem->Release();
+        }
+        PropVariantClear(&prop);
+    }
+    pps->Release();
+    return pD2dBitmap;
+}
+
+ID2D1Bitmap* GetAppBitmap(HWND hwnd) {
+    ID2D1Bitmap* pBitmap = GetUWPAppIcon(hwnd);
+    if (pBitmap) return pBitmap;
+
+    HICON hIcon = NULL;
+    SendMessageTimeout(hwnd, WM_GETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG, 50, (PDWORD_PTR)&hIcon);
+    if (!hIcon) hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
+    if (!hIcon) SendMessageTimeout(hwnd, WM_GETICON, ICON_SMALL, 0, SMTO_ABORTIFHUNG, 50, (PDWORD_PTR)&hIcon);
+    if (!hIcon) hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
+    
+    if (hIcon) return HIconToBitmap(hIcon);
+    return nullptr;
+}
+
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     if (!IsWindowVisible(hwnd)) return TRUE;
     HWND owner = GetWindow(hwnd, GW_OWNER);
@@ -83,7 +139,7 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     GetWindowText(hwnd, title, 256);
     if (wcslen(title) == 0 || wcscmp(title, L"Dock") == 0 || wcscmp(title, L"Program Manager") == 0) return TRUE;
 
-    AppItem app = { hwnd, nullptr, GetColorFromHWND(hwnd), 40.0f, 40.0f, 0.0f };
+    AppItem app = { hwnd, nullptr, GetColorFromHWND(hwnd), 32.0f, 32.0f, 0.0f };
     tempApps.push_back(app);
     return TRUE;
 }
@@ -111,7 +167,7 @@ void RefreshOpenApps() {
             if (open.hwnd == temp.hwnd) { found = true; break; }
         }
         if (!found) {
-            temp.pBitmap = HIconToBitmap(GetWindowIcon(temp.hwnd));
+            temp.pBitmap = GetAppBitmap(temp.hwnd);
             openApps.push_back(temp);
         }
     }
@@ -138,17 +194,23 @@ void Render() {
     RECT windowRect; GetWindowRect(g_hDock, &windowRect);
     bool isHovering = (pt.y >= windowRect.top && pt.y <= windowRect.bottom);
 
-    float baseSize = 40.0f;
-    float maxSize = 90.0f;
-    float gap = 12.0f;
-    float padding = 20.0f;
-    float effectRadius = 140.0f;
+    float baseSize = 32.0f;
+    float maxSize = 80.0f;
+    float gap = 10.0f;
+    float padding = 16.0f;
+    float effectRadius = 120.0f;
 
     int sw = GetSystemMetrics(SM_CXSCREEN);
+    
+    // 🪄 MATEMATİK DÜZELTMESİ: Pencere genişlese bile ikonların "orijinal" statik merkezini buluyoruz.
+    float unmagTotalWidth = padding + (openApps.size() * (baseSize + gap)) + padding;
+    float fixedLeft = (sw - unmagTotalWidth) / 2.0f; 
+
     float currentTotalWidth = padding;
 
     for (size_t i = 0; i < openApps.size(); i++) {
-        float unmagCenter = windowRect.left + padding + (i * (baseSize + gap)) + (baseSize / 2.0f);
+        // 🪄 Farenin hedef alacağı merkez artık mutlak (ekrana sabit). Hiç kaymayacak!
+        float unmagCenter = fixedLeft + padding + 5.0f + (i * (baseSize + gap)) + (baseSize / 2.0f);
         
         if (isHovering) {
             float distance = std::abs(pt.x - unmagCenter);
@@ -167,31 +229,31 @@ void Render() {
     }
     
     int targetWindowWidth = static_cast<int>(currentTotalWidth + padding);
-    int windowHeight = 120; // 🪄 Sabit yükseklik, devasa bloğu engeller
+    int windowHeight = 100; 
     int currentWindowWidth = windowRect.right - windowRect.left;
     
     if (std::abs(targetWindowWidth - currentWindowWidth) > 1 && openApps.size() > 0) {
-        SetWindowPos(g_hDock, NULL, (sw - targetWindowWidth) / 2, GetSystemMetrics(SM_CYSCREEN) - windowHeight - 10, targetWindowWidth, windowHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(g_hDock, NULL, (sw - targetWindowWidth) / 2, GetSystemMetrics(SM_CYSCREEN) - windowHeight, targetWindowWidth, windowHeight, SWP_NOZORDER | SWP_NOACTIVATE);
         pRenderTarget->Resize(D2D1::SizeU(targetWindowWidth, windowHeight));
     }
 
     pRenderTarget->BeginDraw();
-    pRenderTarget->Clear(D2D1::ColorF(0, 0, 0, 0.0f)); // 🪄 Pencereyi tamamen şeffaf yapar
+    pRenderTarget->Clear(D2D1::ColorF(0, 0, 0, 0.0f)); 
 
     auto size = pRenderTarget->GetSize();
     
-    // 🪄 İnce, yarı saydam alt bar (Dock arka planı)
-    float barHeight = baseSize + 20.0f;
-    float barTop = size.height - barHeight - 5.0f;
+    float barHeight = 46.0f; 
+    float bottomMargin = 1.0f; 
+    float barTop = size.height - barHeight - bottomMargin;
     
     ID2D1SolidColorBrush* pDockBrush;
     pRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.1f, 0.1f, 0.5f), &pDockBrush); 
-    D2D1_ROUNDED_RECT dockRect = D2D1::RoundedRect(D2D1::RectF(5, barTop, size.width - 5, size.height - 5), 18.0f, 18.0f);
+    D2D1_ROUNDED_RECT dockRect = D2D1::RoundedRect(D2D1::RectF(5, barTop, size.width - 5, size.height - bottomMargin), 14.0f, 14.0f);
     pRenderTarget->FillRoundedRectangle(dockRect, pDockBrush);
     pDockBrush->Release();
 
     float currentX = padding + 5.0f;
-    float bottomY = size.height - 15.0f; // 🪄 İkonları zemine yapıştırır
+    float bottomY = size.height - bottomMargin - ((barHeight - baseSize) / 2.0f); 
 
     for (size_t i = 0; i < openApps.size(); i++) {
         openApps[i].xOffset = currentX + (openApps[i].currentSize / 2.0f);
@@ -208,7 +270,7 @@ void Render() {
         } else {
             ID2D1SolidColorBrush* pFallbackBrush;
             pRenderTarget->CreateSolidColorBrush(openApps[i].fallbackColor, &pFallbackBrush);
-            pRenderTarget->FillRoundedRectangle(D2D1::RoundedRect(rect, 8.0f, 8.0f), pFallbackBrush);
+            pRenderTarget->FillRoundedRectangle(D2D1::RoundedRect(rect, 6.0f, 6.0f), pFallbackBrush);
             pFallbackBrush->Release();
         }
         
@@ -272,8 +334,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     );
 
     SetLayeredWindowAttributes(g_hDock, 0, 255, LWA_ALPHA);
-    
-    // 🪄 Şeffaflığı sağlayan çekirdek katman (Blur efekti kaldırıldı)
     MARGINS margins = {-1, -1, -1, -1};
     DwmExtendFrameIntoClientArea(g_hDock, &margins);
 
