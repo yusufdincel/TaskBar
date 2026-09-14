@@ -26,7 +26,6 @@ ID2D1Factory* pFactory = nullptr;
 ID2D1HwndRenderTarget* pRenderTarget = nullptr;
 IWICImagingFactory* pWicFactory = nullptr;
 
-// 🪄 Animasyon ve Gizlenme Değişkenleri
 float g_currentYOffset = 0.0f;
 bool g_isForcedVisible = false;
 
@@ -150,6 +149,10 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
 
 void RefreshOpenApps() {
     tempApps.clear();
+    
+    AppItem startBtn = { (HWND)1, nullptr, D2D1::ColorF(0,0,0,0), 32.0f, 32.0f, 0.0f };
+    tempApps.push_back(startBtn);
+
     EnumWindows(EnumWindowsProc, 0);
 
     for (auto it = openApps.begin(); it != openApps.end(); ) {
@@ -171,7 +174,9 @@ void RefreshOpenApps() {
             if (open.hwnd == temp.hwnd) { found = true; break; }
         }
         if (!found) {
-            temp.pBitmap = GetAppBitmap(temp.hwnd);
+            if (temp.hwnd != (HWND)1) { 
+                temp.pBitmap = GetAppBitmap(temp.hwnd);
+            }
             openApps.push_back(temp);
         }
     }
@@ -201,38 +206,34 @@ void Render() {
     int sh = GetSystemMetrics(SM_CYSCREEN);
     int windowHeight = 100; 
 
-    // 🪄 Tam Ekran Uygulama Kontrolü
     bool shouldHide = false;
     HWND fg = GetForegroundWindow();
     if (fg && fg != g_hDock) {
         WCHAR className[256];
         GetClassName(fg, className, 256);
-        // Masaüstü arka planıysa gizleme
         if (wcscmp(className, L"Progman") != 0 && wcscmp(className, L"WorkerW") != 0) {
             RECT fgRect; GetWindowRect(fg, &fgRect);
             if (fgRect.left <= 0 && fgRect.top <= 0 && fgRect.right >= sw && fgRect.bottom >= sh) {
-                shouldHide = true; // F11 Tam Ekran Modu
+                shouldHide = true; 
             } else {
                 WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
                 if (GetWindowPlacement(fg, &wp) && wp.showCmd == SW_MAXIMIZE) {
-                    shouldHide = true; // Büyütülmüş Pencere
+                    shouldHide = true; 
                 }
             }
         }
     }
 
-    // 🪄 Fare Zemin Tetikleyicisi
-    if (pt.y >= sh - 2) g_isForcedVisible = true; // En dibe vurduysa zorla çağır
-    if (pt.y < sh - windowHeight - 10) g_isForcedVisible = false; // Barın yukarısına çıkarsa serbest bırak
+    if (pt.y >= sh - 2) g_isForcedVisible = true; 
+    if (pt.y < sh - windowHeight - 10) g_isForcedVisible = false; 
 
-    // Aşağı Gizlenme Matematiği (Lerp)
     float targetYOffset = (shouldHide && !g_isForcedVisible) ? (float)(windowHeight + 20) : 0.0f;
     g_currentYOffset += (targetYOffset - g_currentYOffset) * 0.25f;
 
     bool isHovering = (pt.y >= windowRect.top && pt.y <= windowRect.bottom && g_currentYOffset < 10.0f);
 
     float baseSize = 32.0f;
-    float maxSize = 80.0f;
+    float maxSize = 54.0f; // 🪄 Animasyon zirvesi "çok çok hafif" olacak şekilde 54'e indirildi
     float gap = 10.0f;
     float padding = 16.0f;
     float effectRadius = 120.0f;
@@ -264,7 +265,6 @@ void Render() {
     int targetWindowWidth = static_cast<int>(currentTotalWidth + padding);
     int currentWindowWidth = windowRect.right - windowRect.left;
     
-    // 🪄 Konumu Y animasyonuyla birlikte dinamik güncelle
     int targetY = sh - windowHeight + static_cast<int>(g_currentYOffset);
     int currentY = windowRect.top;
     
@@ -284,11 +284,19 @@ void Render() {
     float bottomMargin = 1.0f; 
     float barTop = size.height - barHeight - bottomMargin;
     
+    // 🎨 macOS tarzı yarı saydam açık gri arka plan
     ID2D1SolidColorBrush* pDockBrush;
-    pRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.1f, 0.1f, 0.5f), &pDockBrush); 
+    pRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.92f, 0.92f, 0.93f, 0.6f), &pDockBrush); 
     D2D1_ROUNDED_RECT dockRect = D2D1::RoundedRect(D2D1::RectF(5, barTop, size.width - 5, size.height - bottomMargin), 14.0f, 14.0f);
     pRenderTarget->FillRoundedRectangle(dockRect, pDockBrush);
+    
+    // 🎨 İnce ve zarif bir çerçeve çizgisi (Derinlik katar)
+    ID2D1SolidColorBrush* pBorderBrush;
+    pRenderTarget->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.4f), &pBorderBrush);
+    pRenderTarget->DrawRoundedRectangle(dockRect, pBorderBrush, 1.0f);
+    
     pDockBrush->Release();
+    pBorderBrush->Release();
 
     float currentX = padding + 5.0f;
     float bottomY = size.height - bottomMargin - ((barHeight - baseSize) / 2.0f); 
@@ -296,14 +304,31 @@ void Render() {
     for (size_t i = 0; i < openApps.size(); i++) {
         openApps[i].xOffset = currentX + (openApps[i].currentSize / 2.0f);
         
+        float cx = openApps[i].xOffset;
+        float cy = bottomY - (openApps[i].currentSize / 2.0f);
+
         D2D1_RECT_F rect = D2D1::RectF(
-            openApps[i].xOffset - openApps[i].currentSize / 2.0f,
+            cx - openApps[i].currentSize / 2.0f,
             bottomY - openApps[i].currentSize, 
-            openApps[i].xOffset + openApps[i].currentSize / 2.0f,
+            cx + openApps[i].currentSize / 2.0f,
             bottomY
         );
 
-        if (openApps[i].pBitmap) {
+        if (openApps[i].hwnd == (HWND)1) {
+            // 🪄 Kusursuz Windows 11 Logosu (Orijinal oran, boyut ve görünüm)
+            ID2D1SolidColorBrush* pWinBrush;
+            pRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.4705f, 0.8313f), &pWinBrush); 
+            
+            float hg = openApps[i].currentSize * 0.035f; // Yarı boşluk
+            float sq = openApps[i].currentSize * 0.35f;  // Kare boyutu
+            float r  = openApps[i].currentSize * 0.04f;  // Köşe yuvarlatması
+            
+            pRenderTarget->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - hg - sq, cy - hg - sq, cx - hg, cy - hg), r, r), pWinBrush); // Sol Üst
+            pRenderTarget->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx + hg, cy - hg - sq, cx + hg + sq, cy - hg), r, r), pWinBrush); // Sağ Üst
+            pRenderTarget->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - hg - sq, cy + hg, cx - hg, cy + hg + sq), r, r), pWinBrush); // Sol Alt
+            pRenderTarget->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx + hg, cy + hg, cx + hg + sq, cy + hg + sq), r, r), pWinBrush); // Sağ Alt
+            pWinBrush->Release();
+        } else if (openApps[i].pBitmap) {
             pRenderTarget->DrawBitmap(openApps[i].pBitmap, rect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         } else {
             ID2D1SolidColorBrush* pFallbackBrush;
@@ -321,7 +346,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
             InitD2D(hwnd);
-            SetTimer(hwnd, 1, 1000, NULL); 
+            SetTimer(hwnd, 1, 150, NULL); 
             return 0;
             
         case WM_TIMER:
@@ -335,8 +360,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             
             for (auto& app : openApps) {
                 if (std::abs(mouseX - app.xOffset) < (app.currentSize / 2.0f)) {
-                    if (IsIconic(app.hwnd)) ShowWindow(app.hwnd, SW_RESTORE);
-                    SetForegroundWindow(app.hwnd);
+                    if (app.hwnd == (HWND)1) {
+                        keybd_event(VK_LWIN, 0, 0, 0);
+                        keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+                    } else {
+                        if (IsIconic(app.hwnd)) ShowWindow(app.hwnd, SW_RESTORE);
+                        SetForegroundWindow(app.hwnd);
+                    }
                 }
             }
             return 0;
