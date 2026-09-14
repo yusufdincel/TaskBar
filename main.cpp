@@ -26,6 +26,10 @@ ID2D1Factory* pFactory = nullptr;
 ID2D1HwndRenderTarget* pRenderTarget = nullptr;
 IWICImagingFactory* pWicFactory = nullptr;
 
+// 🪄 Animasyon ve Gizlenme Değişkenleri
+float g_currentYOffset = 0.0f;
+bool g_isForcedVisible = false;
+
 struct AppItem {
     HWND hwnd;
     ID2D1Bitmap* pBitmap;
@@ -192,7 +196,40 @@ void Render() {
 
     POINT pt; GetCursorPos(&pt);
     RECT windowRect; GetWindowRect(g_hDock, &windowRect);
-    bool isHovering = (pt.y >= windowRect.top && pt.y <= windowRect.bottom);
+    
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    int windowHeight = 100; 
+
+    // 🪄 Tam Ekran Uygulama Kontrolü
+    bool shouldHide = false;
+    HWND fg = GetForegroundWindow();
+    if (fg && fg != g_hDock) {
+        WCHAR className[256];
+        GetClassName(fg, className, 256);
+        // Masaüstü arka planıysa gizleme
+        if (wcscmp(className, L"Progman") != 0 && wcscmp(className, L"WorkerW") != 0) {
+            RECT fgRect; GetWindowRect(fg, &fgRect);
+            if (fgRect.left <= 0 && fgRect.top <= 0 && fgRect.right >= sw && fgRect.bottom >= sh) {
+                shouldHide = true; // F11 Tam Ekran Modu
+            } else {
+                WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
+                if (GetWindowPlacement(fg, &wp) && wp.showCmd == SW_MAXIMIZE) {
+                    shouldHide = true; // Büyütülmüş Pencere
+                }
+            }
+        }
+    }
+
+    // 🪄 Fare Zemin Tetikleyicisi
+    if (pt.y >= sh - 2) g_isForcedVisible = true; // En dibe vurduysa zorla çağır
+    if (pt.y < sh - windowHeight - 10) g_isForcedVisible = false; // Barın yukarısına çıkarsa serbest bırak
+
+    // Aşağı Gizlenme Matematiği (Lerp)
+    float targetYOffset = (shouldHide && !g_isForcedVisible) ? (float)(windowHeight + 20) : 0.0f;
+    g_currentYOffset += (targetYOffset - g_currentYOffset) * 0.25f;
+
+    bool isHovering = (pt.y >= windowRect.top && pt.y <= windowRect.bottom && g_currentYOffset < 10.0f);
 
     float baseSize = 32.0f;
     float maxSize = 80.0f;
@@ -200,16 +237,12 @@ void Render() {
     float padding = 16.0f;
     float effectRadius = 120.0f;
 
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    
-    // 🪄 MATEMATİK DÜZELTMESİ: Pencere genişlese bile ikonların "orijinal" statik merkezini buluyoruz.
     float unmagTotalWidth = padding + (openApps.size() * (baseSize + gap)) + padding;
     float fixedLeft = (sw - unmagTotalWidth) / 2.0f; 
 
     float currentTotalWidth = padding;
 
     for (size_t i = 0; i < openApps.size(); i++) {
-        // 🪄 Farenin hedef alacağı merkez artık mutlak (ekrana sabit). Hiç kaymayacak!
         float unmagCenter = fixedLeft + padding + 5.0f + (i * (baseSize + gap)) + (baseSize / 2.0f);
         
         if (isHovering) {
@@ -229,12 +262,17 @@ void Render() {
     }
     
     int targetWindowWidth = static_cast<int>(currentTotalWidth + padding);
-    int windowHeight = 100; 
     int currentWindowWidth = windowRect.right - windowRect.left;
     
-    if (std::abs(targetWindowWidth - currentWindowWidth) > 1 && openApps.size() > 0) {
-        SetWindowPos(g_hDock, NULL, (sw - targetWindowWidth) / 2, GetSystemMetrics(SM_CYSCREEN) - windowHeight, targetWindowWidth, windowHeight, SWP_NOZORDER | SWP_NOACTIVATE);
-        pRenderTarget->Resize(D2D1::SizeU(targetWindowWidth, windowHeight));
+    // 🪄 Konumu Y animasyonuyla birlikte dinamik güncelle
+    int targetY = sh - windowHeight + static_cast<int>(g_currentYOffset);
+    int currentY = windowRect.top;
+    
+    if ((std::abs(targetWindowWidth - currentWindowWidth) > 1 || std::abs(targetY - currentY) > 1) && openApps.size() > 0) {
+        SetWindowPos(g_hDock, NULL, (sw - targetWindowWidth) / 2, targetY, targetWindowWidth, windowHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (std::abs(targetWindowWidth - currentWindowWidth) > 1) {
+            pRenderTarget->Resize(D2D1::SizeU(targetWindowWidth, windowHeight));
+        }
     }
 
     pRenderTarget->BeginDraw();
