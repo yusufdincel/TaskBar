@@ -7,6 +7,7 @@
 #include <wincodec.h>
 #include <shobjidl.h>
 #include <propidl.h>
+#include <shellscalingapi.h>
 #include <vector>
 #include <string>
 #include <cmath>
@@ -20,6 +21,11 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "shcore.lib")
+
+#ifndef DWMWA_SYSTEMBACKDROP_TYPE
+#define DWMWA_SYSTEMBACKDROP_TYPE 38
+#endif
 
 const PROPERTYKEY PKEY_AppUserModel_ID_Local = { {0x9F4C2855, 0x9F79, 0x4B39, {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}}, 5 };
 const GUID IID_IPropertyStore_Local = { 0x886d8eeb, 0x8cf2, 0x4446, { 0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99 } };
@@ -34,6 +40,7 @@ ID2D1HwndRenderTarget* pMenuRT = nullptr;
 IWICImagingFactory* pWicFactory = nullptr;
 IDWriteFactory* pDWriteFactory = nullptr;
 IDWriteTextFormat* pTextFormat = nullptr;
+IDWriteTextFormat* pIconFormat = nullptr;
 
 float g_expansion = 0.0f; 
 D2D1_RECT_F g_dockRect = {0}; 
@@ -57,25 +64,36 @@ std::vector<AppItem> openApps;
 struct MenuItem {
     int id;
     std::wstring text;
+    bool isSeparator;
 };
 std::vector<MenuItem> g_menuItems;
-int g_hoveredMenuItem = -1;
+int g_hoveredMenuItem = 0; // 0 tabanlı klavye navigasyonu
 
 std::wstring g_menuAppId;
 HWND g_menuAppHwnd = NULL;
 bool g_menuAppIsPinned = false;
 bool g_menuAppIsUWP = false;
+ID2D1Bitmap* g_menuAppBitmap = nullptr;
 
 class TaskbarGuard {
 public:
     TaskbarGuard() { Toggle(SW_HIDE); }
     ~TaskbarGuard() { Toggle(SW_SHOW); }
+    static void ForceRestore() {
+        HWND h1 = FindWindow(L"Shell_TrayWnd", NULL);
+        if (h1) ShowWindow(h1, SW_SHOW);
+    }
 private:
     void Toggle(int state) {
         HWND h1 = FindWindow(L"Shell_TrayWnd", NULL);
         if (h1) ShowWindow(h1, state);
     }
 };
+
+LONG WINAPI CrashHandler(EXCEPTION_POINTERS*) {
+    TaskbarGuard::ForceRestore();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 void LoadPinnedApps() {
     g_pinnedApps.clear();
@@ -156,10 +174,10 @@ ID2D1Bitmap* GetIconFromIdentifier(const std::wstring& id, bool isUWP, HWND hwnd
         std::wstring parseName = L"shell:AppsFolder\\" + id;
         IShellItem* pItem = nullptr;
         if (SUCCEEDED(SHCreateItemFromParsingName(parseName.c_str(), nullptr, IID_IShellItem_Local, (void**)&pItem))) {
-            IShellItemImageFactory* pFactory = nullptr; ID2D1Bitmap* bmp = nullptr;
-            if (SUCCEEDED(pItem->QueryInterface(IID_IShellItemImageFactory_Local, (void**)&pFactory))) {
+            IShellItemImageFactory* imgFactory = nullptr; ID2D1Bitmap* bmp = nullptr;
+            if (SUCCEEDED(pItem->QueryInterface(IID_IShellItemImageFactory_Local, (void**)&imgFactory))) {
                 HBITMAP hbmp = nullptr; SIZE size = { 64, 64 };
-                if (SUCCEEDED(pFactory->GetImage(size, SIIGBF_ICONONLY, &hbmp))) {
+                if (SUCCEEDED(imgFactory->GetImage(size, SIIGBF_ICONONLY, &hbmp))) {
                     IWICBitmap* pWicBitmap = nullptr;
                     if (SUCCEEDED(pWicFactory->CreateBitmapFromHBITMAP(hbmp, NULL, WICBitmapUseAlpha, &pWicBitmap))) {
                         IWICFormatConverter* pConverter = nullptr; pWicFactory->CreateFormatConverter(&pConverter);
@@ -167,7 +185,7 @@ ID2D1Bitmap* GetIconFromIdentifier(const std::wstring& id, bool isUWP, HWND hwnd
                         pRenderTarget->CreateBitmapFromWicBitmap(pConverter, NULL, &bmp);
                         pConverter->Release(); pWicBitmap->Release();
                     } DeleteObject(hbmp);
-                } pFactory->Release();
+                } imgFactory->Release();
             } pItem->Release(); if (bmp) return bmp;
         }
     }
@@ -312,7 +330,7 @@ void Render() {
     float iconsWidth = 0.0f;
 
     for (size_t i = 0; i < openApps.size(); i++) {
-        float unmagCenter = fixedLeft + padding + 5.0f + (i * (baseSize + gap)) + (baseSize / 2.0f);
+        float unmagCenter = fixedLeft + padding + (i * (baseSize + gap)) + (baseSize / 2.0f);
         
         if (isHovering) {
             float distance = std::abs(pt.x - unmagCenter);
@@ -405,14 +423,13 @@ void Render() {
     pRenderTarget->EndDraw();
 }
 
-// 🎨 KUSURSUZ GÖRSEL MENU (Saydamlık ve Konum Çözüldü)
+// 🎨 NATIVE GÖRÜNÜM & KLAVYE NAVİGASYONLU MENÜ
 LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_PAINT: {
             PAINTSTRUCT ps;
             BeginPaint(hwnd, &ps);
 
-            // 🪄 YENİ: Geç Yükleme (Tuval güvenliği sağlandı)
             if (!pMenuRT) {
                 RECT rc; GetClientRect(hwnd, &rc);
                 pFactory->CreateHwndRenderTarget(
@@ -427,76 +444,107 @@ LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 pMenuRT->Clear(D2D1::ColorF(0, 0, 0, 0.0f));
                 auto size = pMenuRT->GetSize();
                 
-                // Renkler resimle birebir ayarlandı
-                ID2D1SolidColorBrush* pBgBrush; pMenuRT->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.95f, 0.94f, 1.0f), &pBgBrush);
-                ID2D1SolidColorBrush* pBorderBrush; pMenuRT->CreateSolidColorBrush(D2D1::ColorF(0.88f, 0.87f, 0.85f, 1.0f), &pBorderBrush);
+                ID2D1SolidColorBrush* pBgBrush; pMenuRT->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.95f, 0.93f, 1.0f), &pBgBrush);
+                ID2D1SolidColorBrush* pBorderBrush; pMenuRT->CreateSolidColorBrush(D2D1::ColorF(0.85f, 0.84f, 0.82f, 1.0f), &pBorderBrush);
                 ID2D1SolidColorBrush* pTextBrush; pMenuRT->CreateSolidColorBrush(D2D1::ColorF(0.12f, 0.12f, 0.12f, 1.0f), &pTextBrush);
-                ID2D1SolidColorBrush* pHoverBrush; pMenuRT->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.06f), &pHoverBrush);
+                ID2D1SolidColorBrush* pHoverBrush; pMenuRT->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.05f), &pHoverBrush);
+                ID2D1SolidColorBrush* pSepBrush; pMenuRT->CreateSolidColorBrush(D2D1::ColorF(0.82f, 0.80f, 0.78f, 1.0f), &pSepBrush);
                 
                 D2D1_ROUNDED_RECT rect = D2D1::RoundedRect(D2D1::RectF(0.5f, 0.5f, size.width - 0.5f, size.height - 0.5f), 8.0f, 8.0f);
                 pMenuRT->FillRoundedRectangle(rect, pBgBrush); 
                 pMenuRT->DrawRoundedRectangle(rect, pBorderBrush, 1.0f);
                 
-                float itemHeight = 36.0f;
-                float currentY = 8.0f; 
+                float currentY = 6.0f; 
                 
                 for (size_t i = 0; i < g_menuItems.size(); i++) {
-                    D2D1_RECT_F itemRect = D2D1::RectF(6, currentY, size.width - 6, currentY + itemHeight);
-                    if (g_hoveredMenuItem == i) {
+                    if (g_menuItems[i].isSeparator) {
+                        pMenuRT->DrawLine(D2D1::Point2F(10, currentY + 6), D2D1::Point2F(size.width - 10, currentY + 6), pSepBrush, 1.0f);
+                        currentY += 12.0f;
+                        continue;
+                    }
+
+                    float itemHeight = 36.0f;
+                    D2D1_RECT_F itemRect = D2D1::RectF(4, currentY, size.width - 4, currentY + itemHeight);
+                    if (g_hoveredMenuItem == (int)i) {
                         pMenuRT->FillRoundedRectangle(D2D1::RoundedRect(itemRect, 4.0f, 4.0f), pHoverBrush);
                     }
                     
-                    // 🪄 Vektörel Manuel Çizim (Hata Riskini %0'a indirir)
-                    float cx = 22.0f; 
-                    float cy = currentY + (itemHeight / 2.0f);
                     int id = g_menuItems[i].id;
-                    
-                    if (id == 1) { // Ayarlar (Dişli çark benzeri daire)
-                        pMenuRT->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 3.0f, 3.0f), pTextBrush, 1.5f);
-                        pMenuRT->DrawLine(D2D1::Point2F(cx, cy-5.0f), D2D1::Point2F(cx, cy+5.0f), pTextBrush, 1.5f);
-                        pMenuRT->DrawLine(D2D1::Point2F(cx-5.0f, cy), D2D1::Point2F(cx+5.0f, cy), pTextBrush, 1.5f);
-                    } else if (id == 2) { // Sabitleme (Pin)
-                        pMenuRT->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy-2.0f), 2.5f, 2.5f), pTextBrush, 1.5f);
-                        pMenuRT->DrawLine(D2D1::Point2F(cx, cy+0.5f), D2D1::Point2F(cx, cy+6.0f), pTextBrush, 1.5f);
-                    } else if (id == 3) { // Görevi Sonlandır (Yasaklama)
-                        pMenuRT->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 5.0f, 5.0f), pTextBrush, 1.5f);
-                        pMenuRT->DrawLine(D2D1::Point2F(cx-3.5f, cy-3.5f), D2D1::Point2F(cx+3.5f, cy+3.5f), pTextBrush, 1.5f);
-                    } else if (id == 4) { // Kapat (Çarpı)
-                        pMenuRT->DrawLine(D2D1::Point2F(cx-4.0f, cy-4.0f), D2D1::Point2F(cx+4.0f, cy+4.0f), pTextBrush, 1.5f);
-                        pMenuRT->DrawLine(D2D1::Point2F(cx-4.0f, cy+4.0f), D2D1::Point2F(cx+4.0f, cy-4.0f), pTextBrush, 1.5f);
+
+                    if (id == 1 && g_menuAppBitmap) {
+                        D2D1_RECT_F bmpRect = D2D1::RectF(16.0f, currentY + 8.0f, 36.0f, currentY + 28.0f);
+                        pMenuRT->DrawBitmap(g_menuAppBitmap, bmpRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    } else {
+                        float cx = 22.0f, cy = currentY + (itemHeight / 2.0f);
+                        if (id == 2) { // Sabitle / Kaldır (Pin)
+                            pMenuRT->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy-2.0f), 2.5f, 2.5f), pTextBrush, 1.5f);
+                            pMenuRT->DrawLine(D2D1::Point2F(cx, cy+0.5f), D2D1::Point2F(cx, cy+6.0f), pTextBrush, 1.5f);
+                        } else if (id == 3) { // Görevi Sonlandır
+                            pMenuRT->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 5.0f, 5.0f), pTextBrush, 1.5f);
+                            pMenuRT->DrawLine(D2D1::Point2F(cx-3.5f, cy-3.5f), D2D1::Point2F(cx+3.5f, cy+3.5f), pTextBrush, 1.5f);
+                        } else if (id == 4) { // Pencereyi Kapat
+                            pMenuRT->DrawLine(D2D1::Point2F(cx-4.0f, cy-4.0f), D2D1::Point2F(cx+4.0f, cy+4.0f), pTextBrush, 1.5f);
+                            pMenuRT->DrawLine(D2D1::Point2F(cx-4.0f, cy+4.0f), D2D1::Point2F(cx+4.0f, cy-4.0f), pTextBrush, 1.5f);
+                        }
                     }
                     
-                    // Metin
                     if (pTextFormat) {
                         pMenuRT->DrawText(g_menuItems[i].text.c_str(), g_menuItems[i].text.length(), pTextFormat, 
-                                          D2D1::RectF(40, currentY, size.width - 10, currentY + itemHeight), pTextBrush);
+                                          D2D1::RectF(48, currentY, size.width - 10, currentY + itemHeight), pTextBrush);
                     }
                     
                     currentY += itemHeight;
                 }
 
-                pBgBrush->Release(); pBorderBrush->Release(); pTextBrush->Release(); pHoverBrush->Release(); 
+                pBgBrush->Release(); pBorderBrush->Release(); pTextBrush->Release(); pHoverBrush->Release(); pSepBrush->Release();
                 pMenuRT->EndDraw();
             }
-            EndPaint(hwnd, &ps); 
+            EndPaint(hwnd, &ps);
             return 0;
         }
         case WM_MOUSEMOVE: {
             POINT pt; pt.x = GET_X_LPARAM(lParam); pt.y = GET_Y_LPARAM(lParam);
-            int hovered = -1; float currentY = 8.0f; 
+            int hovered = -1; float currentY = 6.0f; 
             for (size_t i = 0; i < g_menuItems.size(); i++) {
-                if (pt.y >= currentY && pt.y <= currentY + 36.0f) { hovered = i; break; }
+                if (g_menuItems[i].isSeparator) { currentY += 12.0f; continue; }
+                if (pt.y >= currentY && pt.y <= currentY + 36.0f) { hovered = (int)i; break; }
                 currentY += 36.0f;
             }
-            if (g_hoveredMenuItem != hovered) { g_hoveredMenuItem = hovered; InvalidateRect(hwnd, NULL, FALSE); }
+            if (hovered != -1 && g_hoveredMenuItem != hovered) { g_hoveredMenuItem = hovered; InvalidateRect(hwnd, NULL, FALSE); }
+            return 0;
+        }
+        case WM_KEYDOWN: {
+            if (wParam == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
+            if (wParam == VK_DOWN) {
+                do { g_hoveredMenuItem = (g_hoveredMenuItem + 1) % g_menuItems.size(); } while (g_menuItems[g_hoveredMenuItem].isSeparator);
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wParam == VK_UP) {
+                do { g_hoveredMenuItem = (g_hoveredMenuItem - 1 + g_menuItems.size()) % g_menuItems.size(); } while (g_menuItems[g_hoveredMenuItem].isSeparator);
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wParam == VK_RETURN) {
+                // Enter tuşu ile tetikleme
+                if (g_hoveredMenuItem >= 0 && g_hoveredMenuItem < (int)g_menuItems.size() && !g_menuItems[g_hoveredMenuItem].isSeparator) {
+                    SendMessage(hwnd, WM_LBUTTONDOWN, 0, 0);
+                }
+            }
             return 0;
         }
         case WM_LBUTTONDOWN: {
-            if (g_hoveredMenuItem >= 0 && g_hoveredMenuItem < g_menuItems.size()) {
+            if (g_hoveredMenuItem >= 0 && g_hoveredMenuItem < (int)g_menuItems.size() && !g_menuItems[g_hoveredMenuItem].isSeparator) {
                 int cmdId = g_menuItems[g_hoveredMenuItem].id;
                 
                 if (cmdId == 1) { 
-                    ShellExecute(NULL, L"open", L"ms-settings:", NULL, NULL, SW_SHOWNORMAL);
+                    if (g_menuAppHwnd) {
+                        if (IsIconic(g_menuAppHwnd)) ShowWindow(g_menuAppHwnd, SW_RESTORE);
+                        SetForegroundWindow(g_menuAppHwnd);
+                    } else {
+                        if (g_menuAppIsUWP) {
+                            std::wstring launchStr = L"shell:AppsFolder\\" + g_menuAppId;
+                            ShellExecute(NULL, L"open", launchStr.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                        } else {
+                            ShellExecute(NULL, L"open", g_menuAppId.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                        }
+                    }
                 } else if (cmdId == 2) { 
                     if (g_menuAppIsPinned) {
                         for (auto it = g_pinnedApps.begin(); it != g_pinnedApps.end(); ++it) {
@@ -519,14 +567,24 @@ LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             DestroyWindow(hwnd); return 0;
         }
         case WM_ACTIVATE: if (LOWORD(wParam) == WA_INACTIVE) DestroyWindow(hwnd); return 0;
-        case WM_DESTROY: if (pMenuRT) { pMenuRT->Release(); pMenuRT = nullptr; } g_hMenu = NULL; return 0;
+        case WM_DESTROY: 
+            if (pMenuRT) { pMenuRT->Release(); pMenuRT = nullptr; } 
+            if (g_menuAppBitmap) { g_menuAppBitmap->Release(); g_menuAppBitmap = nullptr; } 
+            g_hMenu = NULL; 
+            return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-        case WM_CREATE: InitD2D(hwnd); SetTimer(hwnd, 1, 150, NULL); return 0;
+        case WM_CREATE: {
+            SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+            InitD2D(hwnd); 
+            SetTimer(hwnd, 1, 150, NULL); 
+            SetUnhandledExceptionFilter(CrashHandler);
+            return 0;
+        }
         case WM_TIMER: if (wParam == 1 && !g_hMenu) RefreshOpenApps(); return 0;
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE; 
         
@@ -547,37 +605,72 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             for (auto& app : openApps) {
                 if (std::abs(mouseX - app.xOffset) < (app.currentSize / 2.0f)) {
                     if (app.hwnd != (HWND)1) {
-                        if (g_hMenu) DestroyWindow(g_hMenu);
+                        if (g_hMenu) {
+                            bool clickedSame = (g_menuAppId == app.id);
+                            DestroyWindow(g_hMenu);
+                            if (clickedSame) break; 
+                        }
                         
                         g_menuAppId = app.id;
                         g_menuAppHwnd = app.hwnd;
                         g_menuAppIsPinned = app.isPinned;
                         g_menuAppIsUWP = app.isUWP;
-                        g_hoveredMenuItem = -1;
+                        g_hoveredMenuItem = 0; // İlk öğe seçili başlasın
                         
+                        if (g_menuAppBitmap) { g_menuAppBitmap->Release(); g_menuAppBitmap = nullptr; }
+                        g_menuAppBitmap = app.pBitmap;
+                        if (g_menuAppBitmap) g_menuAppBitmap->AddRef();
+                        
+                        WCHAR title[256] = L"Uygulamayı Aç";
+                        if (app.hwnd) {
+                            GetWindowText(app.hwnd, title, 256);
+                            if (wcslen(title) == 0) wcscpy(title, L"Uygulama");
+                        } else {
+                            std::wstring n = app.id;
+                            size_t pos = n.find_last_of(L"\\");
+                            if (pos != std::wstring::npos) n = n.substr(pos + 1);
+                            pos = n.find_last_of(L".");
+                            if (pos != std::wstring::npos) n = n.substr(0, pos);
+                            if (!n.empty()) wcscpy(title, n.c_str());
+                        }
+
                         g_menuItems.clear();
-                        g_menuItems.push_back({1, L"Ayarlar"});
-                        if (g_menuAppIsPinned) g_menuItems.push_back({2, L"Görev çubuğundan kaldır"});
-                        else g_menuItems.push_back({2, L"Görev çubuğuna sabitle"});
+                        g_menuItems.push_back({1, title, L"", false}); 
+                        g_menuItems.push_back({0, L"", L"", true}); // Ayraç (Separator)
+                        
+                        if (g_menuAppIsPinned) g_menuItems.push_back({2, L"Görev çubuğundan kaldır", L"", false});
+                        else g_menuItems.push_back({2, L"Görev çubuğuna sabitle", L"", false});
                         
                         if (g_menuAppHwnd) {
-                            g_menuItems.push_back({3, L"Görevi sonlandır"}); 
-                            g_menuItems.push_back({4, L"Pencereyi kapat"});  
+                            g_menuItems.push_back({3, L"Görevi sonlandır", L"", false}); 
+                            g_menuItems.push_back({4, L"Pencereyi kapat", L"", false});  
                         }
                         
-                        // 🪄 YENİ: Tam Mutlak Konumlandırma (Aşırı yukarıda açılmayı KÖKÜNDEN çözer)
-                        int menuWidth = 230;
-                        int menuHeight = g_menuItems.size() * 36 + 16;
-                        int menuX = static_cast<int>((rc.left + app.xOffset) - (menuWidth / 2.0f));
+                        int menuWidth = 240;
+                        int itemCount = 0;
+                        for (auto& item : g_menuItems) {
+                            if (item.isSeparator) itemCount += 0.3f;
+                            else itemCount += 1.0f;
+                        }
+                        int menuHeight = static_cast<int>(itemCount * 36.0f + 16.0f);
                         
+                        int menuX = static_cast<int>((rc.left + app.xOffset) - (menuWidth / 2.0f));
                         int sh = GetSystemMetrics(SM_CYSCREEN);
-                        int menuY = sh - 62 - menuHeight; // Ekranın mutlak alt çizgisinden tam olarak menü + 8 piksel yukarıya hizalar.
+                        int visualBarTop = sh - 54; 
+                        int menuY = visualBarTop - menuHeight - 12; 
                         
                         g_hMenu = CreateWindowEx(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"MacDockMenu", L"", WS_POPUP, menuX, menuY, menuWidth, menuHeight, NULL, NULL, GetModuleHandle(NULL), NULL);
+                        
+                        // Mica / Acrylic Blur Efekti
+                        BackdropType backdrop = DWMSBT_TRANSIENT;
+                        DwmSetWindowAttribute(g_hMenu, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
+
                         SetLayeredWindowAttributes(g_hMenu, 0, 255, LWA_ALPHA);
                         MARGINS margins = {-1, -1, -1, -1}; DwmExtendFrameIntoClientArea(g_hMenu, &margins);
                         DWORD corners = 2; DwmSetWindowAttribute(g_hMenu, 33, &corners, sizeof(corners)); 
-                        ShowWindow(g_hMenu, SW_SHOW); SetForegroundWindow(g_hMenu); 
+                        
+                        ShowWindow(g_hMenu, SW_SHOW); 
+                        SetFocus(g_hMenu); // Klavye odaklanması için şart
                     } break;
                 }
             } return 0;
@@ -616,6 +709,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
+    SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+
     HANDLE hMutex = CreateMutex(NULL, TRUE, L"MacDockMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         MessageBox(NULL, L"Dock zaten arka planda çalışıyor!", L"Bilgi", MB_OK | MB_ICONWARNING);
